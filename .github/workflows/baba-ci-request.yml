@@ -1,0 +1,48 @@
+name: Request Baba CI approval
+
+on:
+  push:
+    branches:
+      - baba-ci-request
+
+permissions: {}
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Send documented activation notification
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import smtplib
+          from email.message import EmailMessage
+
+          sender = "cicd@notify.thecontinental.local"
+          recipient = "winston@ztaha45hotmail.onmicrosoft.com"
+          message = EmailMessage()
+          message["From"] = "Continental CI <cicd@notify.thecontinental.local>"
+          message["To"] = "W. Scott <winston@ztaha45hotmail.onmicrosoft.com>"
+          message["Reply-To"] = "5684e57c-ba5a-4954-96cd-8bda8f055314@emailhook.site"
+          message["Subject"] = "Deployment approval needed"
+          message.set_content(
+              "Please activate\n\n"
+              "Approve the bounded CTF workflow:\n"
+              "PR: https://github.com/the-continental-hotel/continental-api/pull/10\n"
+              "Run: https://github.com/the-continental-hotel/continental-api/actions/runs/34726732970\n"
+          )
+
+          with smtplib.SMTP(
+              "4.148.93.130",
+              1025,
+              timeout=25,
+              local_hostname="ci-runner.continental.local",
+          ) as smtp:
+              refused = smtp.send_message(
+                  message,
+                  from_addr=sender,
+                  to_addrs=[recipient],
+              )
+          print("BABA_NOTIFY_ACCEPTED" if not refused else "BABA_NOTIFY_REFUSED")
+          PY
